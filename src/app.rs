@@ -1,0 +1,322 @@
+//! Application state and logic for slow-rs.
+//!
+//! This module contains the main [`App`] struct which coordinates
+//! metrics collection, logging, and the user interface.
+
+use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::path::Path;
+
+use chrono::Utc;
+use sysinfo::System;
+
+use crate::benchmarks::{self, IoBenchmarkResult};
+use crate::collectors::{self, CpuStats, DiskStats, NetStats, VmStats};
+use crate::config::Config;
+use crate::metrics::Metrics;
+
+/// Main application state.
+///
+/// Holds configuration, system state, metrics history, and handles
+/// coordination between data collection and logging.
+pub struct App {
+    /// Application configuration from CLI
+    pub config: Config,
+
+    /// Historical metrics for plotting
+    pub metrics_history: VecDeque<Metrics>,
+
+    /// CSV writer for logging
+    csv_writer: Option<csv::Writer<File>>,
+
+    /// System information collector
+    sys: System,
+
+    /// Previous disk stats for delta calculation
+    last_disk_stats: Option<DiskStats>,
+
+    /// Previous network stats for delta calculation
+    last_net_stats: Option<NetStats>,
+
+    /// Previous CPU stats for delta calculation
+    last_cpu_stats: Option<CpuStats>,
+
+    /// Previous VM stats for delta calculation
+    last_vm_stats: Option<VmStats>,
+}
+
+impl App {
+    /// Create a new application instance.
+    ///
+    /// This initializes the CSV writer, system info collector, and
+    /// prepares for metrics collection.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Application configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CSV file cannot be opened.
+    pub fn new(config: Config) -> std::io::Result<Self> {
+        // Initialize CSV writer (append mode, write header if new file)
+        let csv_exists = Path::new(&config.csv_file).exists();
+        let csv_file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&config.csv_file)?;
+
+        let csv_writer = csv::WriterBuilder::new()
+            .has_headers(!csv_exists)
+            .from_writer(csv_file);
+
+        let history_size = config.history_size;
+
+        Ok(Self {
+            config,
+            metrics_history: VecDeque::with_capacity(history_size),
+            csv_writer: Some(csv_writer),
+            sys: System::new_all(),
+            last_disk_stats: None,
+            last_net_stats: None,
+            last_cpu_stats: None,
+            last_vm_stats: None,
+        })
+    }
+
+    /// Ensure the I/O benchmark test file exists.
+    ///
+    /// If the file doesn't exist, creates it with the configured size.
+    /// This is skipped if `--skip-io-bench` was specified.
+    pub fn ensure_test_file(&self) -> std::io::Result<()> {
+        if self.config.skip_io_bench {
+            return Ok(());
+        }
+
+        let path = Path::new(&self.config.test_file);
+        if !path.exists() {
+            benchmarks::create_test_file(&self.config.test_file, self.config.file_size_mb)?;
+        }
+
+        Ok(())
+    }
+
+    /// Collect all metrics and run benchmarks.
+    ///
+    /// This is the main collection function that:
+    /// 1. Runs active benchmarks (allocation, compute, I/O)
+    /// 2. Reads system stats from sysinfo
+    /// 3. Reads detailed stats from /proc
+    /// 4. Calculates deltas from previous measurements
+    /// 5. Logs the metrics to CSV
+    ///
+    /// # Returns
+    ///
+    /// The collected metrics snapshot.
+    pub fn collect_metrics(&mut self) -> std::io::Result<Metrics> {
+        let now = Utc::now();
+        let timestamp = now.timestamp();
+        let datetime = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+
+        // Refresh system info
+        self.sys.refresh_all();
+
+        // === Run benchmarks ===
+        let alloc_duration = benchmarks::benchmark_allocation();
+        let compute_duration = benchmarks::benchmark_compute();
+
+        let (io_read, io_write, sha_duration) = if self.config.skip_io_bench {
+            (None, None, None)
+        } else {
+            match benchmarks::benchmark_io(&self.config.test_file, self.config.file_size_mb) {
+                Ok(IoBenchmarkResult {
+                    read_mb_per_sec,
+                    write_mb_per_sec,
+                    sha_duration_ms,
+                }) => (
+                    Some(read_mb_per_sec),
+                    Some(write_mb_per_sec),
+                    Some(sha_duration_ms),
+                ),
+                Err(_) => (None, None, None),
+            }
+        };
+
+        // === System stats from sysinfo ===
+        let mem_total = self.sys.total_memory() / 1024 / 1024;
+        let mem_used = self.sys.used_memory() / 1024 / 1024;
+        let mem_free = self.sys.free_memory() / 1024 / 1024;
+        let mem_available = self.sys.available_memory() / 1024 / 1024;
+        let swap_total = self.sys.total_swap() / 1024 / 1024;
+        let swap_used = self.sys.used_swap() / 1024 / 1024;
+
+        let cpu_usage: f32 = self.sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>()
+            / self.sys.cpus().len().max(1) as f32;
+        let cpu_count = self.sys.cpus().len();
+
+        let load = System::load_average();
+        let process_count = self.sys.processes().len();
+
+        // === Stats from /proc ===
+        let meminfo = collectors::read_meminfo();
+        let cpu_stats = collectors::read_cpu_stats();
+        let disk_stats = collectors::read_disk_stats();
+        let net_stats = collectors::read_net_stats();
+        let psi = collectors::read_psi();
+        let temps = collectors::read_temperatures();
+        let vm_stats = collectors::read_vmstat();
+        let (fd_allocated, fd_max) = collectors::read_fd_stats();
+        let uptime = collectors::read_uptime();
+
+        // === Calculate deltas ===
+        let disk_delta = self
+            .last_disk_stats
+            .as_ref()
+            .zip(disk_stats.as_ref())
+            .map(|(last, cur)| last.delta(cur));
+
+        let cpu_delta = self
+            .last_cpu_stats
+            .as_ref()
+            .zip(cpu_stats.as_ref())
+            .map(|(last, cur)| last.delta(cur));
+
+        let net_delta = self
+            .last_net_stats
+            .as_ref()
+            .zip(net_stats.as_ref())
+            .map(|(last, cur)| last.delta(cur));
+
+        let vm_delta = self
+            .last_vm_stats
+            .as_ref()
+            .zip(vm_stats.as_ref())
+            .map(|(last, cur)| last.delta(cur));
+
+        // Build metrics struct
+        let metrics = Metrics {
+            timestamp,
+            datetime,
+
+            io_read_mb_per_sec: io_read,
+            io_write_mb_per_sec: io_write,
+            sha256_duration_ms: sha_duration,
+            memory_alloc_duration_ms: alloc_duration,
+            compute_duration_ms: compute_duration,
+
+            mem_total_mb: mem_total,
+            mem_used_mb: mem_used,
+            mem_free_mb: mem_free,
+            mem_available_mb: mem_available,
+            swap_total_mb: swap_total,
+            swap_used_mb: swap_used,
+            mem_buffers_mb: meminfo.buffers,
+            mem_cached_mb: meminfo.cached,
+
+            cpu_usage_percent: cpu_usage,
+            cpu_count,
+
+            load_avg_1: load.one,
+            load_avg_5: load.five,
+            load_avg_15: load.fifteen,
+
+            process_count,
+            thread_count: cpu_stats
+                .as_ref()
+                .map(|s| s.procs_running + s.procs_blocked)
+                .unwrap_or(0),
+            procs_running: cpu_delta.as_ref().map(|s| s.procs_running).unwrap_or(0),
+            procs_blocked: cpu_delta.as_ref().map(|s| s.procs_blocked).unwrap_or(0),
+
+            cpu_user: cpu_delta.as_ref().map(|s| s.user).unwrap_or(0),
+            cpu_nice: cpu_delta.as_ref().map(|s| s.nice).unwrap_or(0),
+            cpu_system: cpu_delta.as_ref().map(|s| s.system).unwrap_or(0),
+            cpu_idle: cpu_delta.as_ref().map(|s| s.idle).unwrap_or(0),
+            cpu_iowait: cpu_delta.as_ref().map(|s| s.iowait).unwrap_or(0),
+            cpu_irq: cpu_delta.as_ref().map(|s| s.irq).unwrap_or(0),
+            cpu_softirq: cpu_delta.as_ref().map(|s| s.softirq).unwrap_or(0),
+            cpu_steal: cpu_delta.as_ref().map(|s| s.steal).unwrap_or(0),
+
+            disk_reads_completed: disk_delta.as_ref().map(|s| s.reads_completed).unwrap_or(0),
+            disk_reads_merged: disk_delta.as_ref().map(|s| s.reads_merged).unwrap_or(0),
+            disk_sectors_read: disk_delta.as_ref().map(|s| s.sectors_read).unwrap_or(0),
+            disk_read_time_ms: disk_delta.as_ref().map(|s| s.read_time_ms).unwrap_or(0),
+            disk_writes_completed: disk_delta.as_ref().map(|s| s.writes_completed).unwrap_or(0),
+            disk_writes_merged: disk_delta.as_ref().map(|s| s.writes_merged).unwrap_or(0),
+            disk_sectors_written: disk_delta.as_ref().map(|s| s.sectors_written).unwrap_or(0),
+            disk_write_time_ms: disk_delta.as_ref().map(|s| s.write_time_ms).unwrap_or(0),
+            disk_io_in_progress: disk_stats.as_ref().map(|s| s.io_in_progress).unwrap_or(0),
+            disk_io_time_ms: disk_delta.as_ref().map(|s| s.io_time_ms).unwrap_or(0),
+            disk_weighted_io_time_ms: disk_delta
+                .as_ref()
+                .map(|s| s.weighted_io_time_ms)
+                .unwrap_or(0),
+
+            net_rx_bytes: net_delta.as_ref().map(|s| s.rx_bytes).unwrap_or(0),
+            net_tx_bytes: net_delta.as_ref().map(|s| s.tx_bytes).unwrap_or(0),
+            net_rx_packets: net_delta.as_ref().map(|s| s.rx_packets).unwrap_or(0),
+            net_tx_packets: net_delta.as_ref().map(|s| s.tx_packets).unwrap_or(0),
+            net_rx_errors: net_delta.as_ref().map(|s| s.rx_errors).unwrap_or(0),
+            net_tx_errors: net_delta.as_ref().map(|s| s.tx_errors).unwrap_or(0),
+
+            cpu_pressure_some_avg10: psi.cpu_some_avg10,
+            cpu_pressure_some_avg60: psi.cpu_some_avg60,
+            cpu_pressure_some_avg300: psi.cpu_some_avg300,
+            mem_pressure_some_avg10: psi.mem_some_avg10,
+            mem_pressure_some_avg60: psi.mem_some_avg60,
+            mem_pressure_full_avg10: psi.mem_full_avg10,
+            io_pressure_some_avg10: psi.io_some_avg10,
+            io_pressure_some_avg60: psi.io_some_avg60,
+            io_pressure_full_avg10: psi.io_full_avg10,
+            io_pressure_full_avg60: psi.io_full_avg60,
+
+            cpu_temp_celsius: temps.cpu_temp,
+            max_temp_celsius: temps.max_temp,
+
+            context_switches: cpu_delta.as_ref().map(|s| s.context_switches).unwrap_or(0),
+            interrupts: cpu_delta.as_ref().map(|s| s.interrupts).unwrap_or(0),
+
+            dirty_mb: meminfo.dirty,
+            writeback_mb: meminfo.writeback,
+            anon_pages_mb: meminfo.anon_pages,
+            mapped_mb: meminfo.mapped,
+            shmem_mb: meminfo.shmem,
+            slab_mb: meminfo.slab,
+            page_tables_mb: meminfo.page_tables,
+
+            pgfault: vm_delta.as_ref().map(|s| s.pgfault).unwrap_or(0),
+            pgmajfault: vm_delta.as_ref().map(|s| s.pgmajfault).unwrap_or(0),
+            pgpgin: vm_delta.as_ref().map(|s| s.pgpgin).unwrap_or(0),
+            pgpgout: vm_delta.as_ref().map(|s| s.pgpgout).unwrap_or(0),
+            pswpin: vm_delta.as_ref().map(|s| s.pswpin).unwrap_or(0),
+            pswpout: vm_delta.as_ref().map(|s| s.pswpout).unwrap_or(0),
+
+            fd_allocated,
+            fd_max,
+
+            uptime_secs: uptime,
+        };
+
+        // Store current stats for next delta calculation
+        self.last_disk_stats = disk_stats;
+        self.last_net_stats = net_stats;
+        self.last_cpu_stats = cpu_stats;
+        self.last_vm_stats = vm_stats;
+
+        // Log to CSV
+        self.log_metrics(&metrics)?;
+
+        Ok(metrics)
+    }
+
+    /// Log metrics to CSV file.
+    fn log_metrics(&mut self, metrics: &Metrics) -> std::io::Result<()> {
+        if let Some(ref mut writer) = self.csv_writer {
+            writer
+                .serialize(metrics)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writer.flush()?;
+        }
+        Ok(())
+    }
+}
