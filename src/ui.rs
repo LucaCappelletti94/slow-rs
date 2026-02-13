@@ -656,35 +656,16 @@ fn draw_line_chart<F>(
         .style(Style::default().fg(color))
         .data(&data)];
 
-    // Helper to create dashed line using horizontal bar characters
-    // Creates groups of closely-spaced points that render as dashes
-    let make_dashed_line = |y: f64, len: usize| -> Vec<(f64, f64)> {
-        let mut points = Vec::new();
-        let dash_len = 4;
-        let gap_len = 3;
-        let mut x = 0;
-        while x < len {
-            // Create a dash segment with multiple points
-            for i in 0..dash_len {
-                if x + i < len {
-                    points.push(((x + i) as f64, y));
-                }
-            }
-            x += dash_len + gap_len;
-        }
-        points
-    };
-
     // Add warning threshold line (only if data is near threshold)
     let warning_line: Vec<(f64, f64)>;
     if show_warning {
         if let Some(w) = warning {
-            warning_line = make_dashed_line(w, data_len);
+            warning_line = vec![(0.0, w), (data_len as f64, w)];
             datasets.push(
                 Dataset::default()
-                    .name("─ warn")
+                    .name("warn")
                     .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Scatter)
+                    .graph_type(GraphType::Line)
                     .style(Style::default().fg(Color::Yellow))
                     .data(&warning_line),
             );
@@ -695,12 +676,12 @@ fn draw_line_chart<F>(
     let critical_line: Vec<(f64, f64)>;
     if show_critical {
         if let Some(c) = critical {
-            critical_line = make_dashed_line(c, data_len);
+            critical_line = vec![(0.0, c), (data_len as f64, c)];
             datasets.push(
                 Dataset::default()
-                    .name("─ crit")
+                    .name("crit")
                     .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Scatter)
+                    .graph_type(GraphType::Line)
                     .style(Style::default().fg(Color::Red))
                     .data(&critical_line),
             );
