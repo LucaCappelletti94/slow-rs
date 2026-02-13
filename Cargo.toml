@@ -2,14 +2,41 @@
 name = "slow-rs"
 version = "0.1.0"
 edition = "2021"
+authors = ["Luca Cappelletti"]
+description = "System slowness diagnostic monitor - identify disk, memory, CPU, and thermal issues"
+license = "MIT"
+repository = "https://github.com/LucaCappelletti94/slow-rs"
+homepage = "https://github.com/LucaCappelletti94/slow-rs"
+documentation = "https://docs.rs/slow-rs"
+readme = "README.md"
+keywords = ["monitoring", "diagnostics", "performance", "system", "linux"]
+categories = ["command-line-utilities", "development-tools::profiling"]
+rust-version = "1.70"
+exclude = [
+    ".github/",
+    "metrics.csv",
+    "*.bin",
+]
+
+[[bin]]
+name = "slow-rs"
+path = "src/main.rs"
 
 [dependencies]
 sha2 = "0.10"
 sysinfo = "0.38.1"
 serde = { version = "1.0", features = ["derive"] }
-clap = { version = "4.5.58", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
 csv = "1.3"
 ratatui = "0.30"
 crossterm = "0.29"
-libc = "0.2.182"
+libc = "0.2"
+
+[dev-dependencies]
+cargo-husky = { version = "1", features = ["precommit-hook", "run-cargo-fmt", "run-cargo-clippy"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

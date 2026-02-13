@@ -6,6 +6,7 @@
 use std::process::Command;
 
 use crate::availability::MetricAvailability;
+use crate::metrics::{IpmiDimmTemp, IpmiTempReading};
 
 /// IPMI sensor information.
 #[derive(Clone, Debug, Default)]
@@ -113,13 +114,22 @@ impl IpmiSensors {
     }
 
     /// Get all DIMM/memory temperature sensors.
+    ///
+    /// Matches various vendor naming conventions:
+    /// - "DIMMA1", "P1-DIMMC1" (Supermicro)
+    /// - "MEM Temp", "Memory Temp" (Dell, HP)
+    /// - "DRAM Temp" (some vendors)
     pub fn dimm_sensors(&self) -> Vec<&IpmiSensor> {
         self.sensors
             .iter()
             .filter(|s| {
                 let name_lower = s.name.to_lowercase();
-                (name_lower.contains("dimm") || name_lower.contains("mem"))
-                    && (s.unit.contains("degrees") || s.unit.contains("C"))
+                let is_memory_sensor = name_lower.contains("dimm")
+                    || name_lower.contains("mem")
+                    || name_lower.contains("dram");
+                let is_temperature =
+                    s.unit.contains("degrees") || s.unit.to_lowercase().contains("c");
+                is_memory_sensor && is_temperature
             })
             .collect()
     }
@@ -174,6 +184,46 @@ impl IpmiSensors {
             None
         } else {
             Some(details.join(", "))
+        }
+    }
+
+    /// Get individual DIMM temperatures for plotting.
+    pub fn get_dimm_temps(&self) -> Vec<IpmiDimmTemp> {
+        self.dimm_sensors()
+            .iter()
+            .filter(|s| s.status != SensorStatus::NotAvailable)
+            .map(|s| IpmiDimmTemp {
+                name: s.name.trim().to_string(),
+                temp_celsius: s.value,
+                status: Self::status_to_string(&s.status),
+            })
+            .collect()
+    }
+
+    /// Get all temperature sensors for plotting.
+    pub fn get_all_temps(&self) -> Vec<IpmiTempReading> {
+        self.sensors
+            .iter()
+            .filter(|s| {
+                s.status != SensorStatus::NotAvailable
+                    && (s.unit.contains("degrees") || s.unit.contains("C"))
+            })
+            .map(|s| IpmiTempReading {
+                name: s.name.trim().to_string(),
+                temp_celsius: s.value,
+                status: Self::status_to_string(&s.status),
+            })
+            .collect()
+    }
+
+    /// Convert status to string representation.
+    fn status_to_string(status: &SensorStatus) -> String {
+        match status {
+            SensorStatus::Ok => "ok".to_string(),
+            SensorStatus::NonCritical => "nc".to_string(),
+            SensorStatus::Critical => "cr".to_string(),
+            SensorStatus::NonRecoverable => "nr".to_string(),
+            SensorStatus::NotAvailable => "na".to_string(),
         }
     }
 }

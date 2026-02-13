@@ -28,7 +28,8 @@ use ratatui::{
     symbols,
     text::Span,
     widgets::{
-        Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph,
+        Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, LegendPosition, List,
+        ListItem, Paragraph,
     },
     Frame, Terminal,
 };
@@ -80,7 +81,12 @@ fn run_tui_loop(
     let mut last_collection = Instant::now();
     let mut _scroll_offset = 0usize;
 
-    // Initial collection
+    // Draw loading screen immediately so user sees something
+    terminal.draw(|f| {
+        draw_loading_screen(f);
+    })?;
+
+    // Initial collection (this is the slow part)
     if let Ok(metrics) = app.collect_metrics() {
         add_metrics(&mut app.metrics_history, metrics, history_size);
     }
@@ -212,6 +218,42 @@ fn draw_ui(
 
     // Details
     draw_details(f, metrics_history, main_chunks[chunk_idx]);
+}
+
+/// Draw a loading screen while initial metrics are being collected.
+fn draw_loading_screen(f: &mut Frame) {
+    let size = f.area();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title("slow-rs")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let text = [
+        "",
+        "  Collecting initial metrics...",
+        "",
+        "  This includes:",
+        "    - I/O benchmarks (read/write speed)",
+        "    - Memory allocation tests",
+        "    - CPU compute benchmarks",
+        "    - SMART disk health (if available)",
+        "    - IPMI/BMC sensors (if available)",
+        "",
+        "  Please wait...",
+    ]
+    .join("\n");
+
+    let paragraph = Paragraph::new(text)
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(block);
+
+    f.render_widget(paragraph, size);
 }
 
 /// Draw the top status bar.
@@ -516,54 +558,258 @@ fn draw_charts(
         },
     );
 
-    // IPMI Status panel (shows DIMM status from BMC)
-    draw_ipmi_status(f, latest, row3[2]);
+    // IPMI Temperature chart (shows all DIMM temps from BMC)
+    draw_ipmi_temps_chart(f, metrics_history, thresholds, row3[2]);
 }
 
-/// Draw IPMI status panel showing BMC sensor status.
-fn draw_ipmi_status(f: &mut Frame, metrics: &Metrics, area: Rect) {
-    let (status_text, fg_color, bg_color, is_critical) =
-        if let Some(ref status) = metrics.ipmi_dimm_status {
-            match status.as_str() {
-                "nr" => ("⛔ NON-RECOVERABLE ⛔", Color::White, Color::Red, true),
-                "cr" => ("🔴 CRITICAL", Color::White, Color::Red, true),
-                "nc" => ("🟡 WARNING", Color::Black, Color::Yellow, false),
-                "ok" => ("✓ OK", Color::Green, Color::Reset, false),
-                _ => ("Unknown", Color::Gray, Color::Reset, false),
-            }
-        } else if metrics.ipmi_available == Some(true) {
-            ("No DIMM sensors", Color::Gray, Color::Reset, false)
-        } else {
-            ("N/A (need sudo)", Color::DarkGray, Color::Reset, false)
-        };
-
-    // Show detailed DIMM info if available
-    let content = if let Some(ref details) = metrics.ipmi_dimm_details {
-        format!("{}\n{}", status_text, details)
-    } else {
-        status_text.to_string()
+/// Draw IPMI temperature chart showing all DIMM temperatures over time.
+fn draw_ipmi_temps_chart(
+    f: &mut Frame,
+    metrics_history: &VecDeque<Metrics>,
+    thresholds: &Thresholds,
+    area: Rect,
+) {
+    // Check if we have any IPMI data
+    let latest = match metrics_history.back() {
+        Some(m) => m,
+        None => return,
     };
 
-    let border_color = if is_critical { Color::Red } else { fg_color };
+    // If no IPMI data, show a placeholder
+    if latest.ipmi_available != Some(true) || latest.ipmi_dimm_temps.is_empty() {
+        let (text, color) = if latest.ipmi_available == Some(true) {
+            ("No DIMM sensors found", Color::Gray)
+        } else {
+            ("N/A (need sudo + ipmitool)", Color::DarkGray)
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title("IPMI DIMM °C [ipmitool]")
+            .border_style(Style::default().fg(color));
+
+        let paragraph = Paragraph::new(text)
+            .style(Style::default().fg(color))
+            .block(block);
+
+        f.render_widget(paragraph, area);
+        return;
+    }
+
+    // Get unique DIMM names from latest reading
+    let dimm_names: Vec<String> = latest
+        .ipmi_dimm_temps
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+
+    if dimm_names.is_empty() {
+        return;
+    }
+
+    // Define colors for different DIMMs (cycle through these)
+    let colors = [
+        Color::Cyan,
+        Color::Yellow,
+        Color::Magenta,
+        Color::Green,
+        Color::LightBlue,
+        Color::LightRed,
+        Color::LightCyan,
+        Color::LightMagenta,
+    ];
+
+    // Build data series for each DIMM
+    let mut datasets_data: Vec<Vec<(f64, f64)>> = vec![Vec::new(); dimm_names.len()];
+
+    for (time_idx, metrics) in metrics_history.iter().enumerate() {
+        for (dimm_idx, dimm_name) in dimm_names.iter().enumerate() {
+            // Find the temperature for this DIMM at this time
+            let temp = metrics
+                .ipmi_dimm_temps
+                .iter()
+                .find(|d| &d.name == dimm_name)
+                .map(|d| d.temp_celsius)
+                .unwrap_or(0.0);
+
+            datasets_data[dimm_idx].push((time_idx as f64, temp));
+        }
+    }
+
+    // Calculate Y-axis bounds
+    let all_temps: Vec<f64> = datasets_data
+        .iter()
+        .flat_map(|d| d.iter().map(|(_, t)| *t))
+        .collect();
+
+    let min_y = all_temps
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min)
+        .max(0.0);
+    let max_y = all_temps.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    // Include thresholds in range calculation
+    let warn_temp = thresholds.dimm_temp_warning;
+    let crit_temp = thresholds.dimm_temp_critical;
+
+    let range_max = max_y.max(warn_temp * 0.9);
+    let y_range = if (range_max - min_y).abs() < 1.0 {
+        (min_y - 5.0, range_max + 5.0)
+    } else {
+        (min_y * 0.95, range_max * 1.05)
+    };
+
+    // Determine severity based on max temperature
+    let max_temp = latest.ipmi_dimm_temp_max.unwrap_or(0.0);
+    let severity = thresholds.dimm_temp_severity(max_temp);
+
+    let (border_color, title_style) = match severity {
+        Severity::Critical => (
+            Color::Red,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Severity::Warning => (
+            Color::Yellow,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Severity::Normal => (Color::Reset, Style::default()),
+    };
+
+    // Build datasets for the chart
+    let mut datasets: Vec<Dataset> = Vec::new();
+
+    for (idx, (dimm_name, data)) in dimm_names.iter().zip(datasets_data.iter()).enumerate() {
+        let color = colors[idx % colors.len()];
+
+        // Shorten the name for the legend (e.g., "P1-DIMMA1" -> "A1")
+        let short_name = shorten_dimm_name(dimm_name);
+
+        // Get current temperature for this DIMM
+        let current_temp = latest
+            .ipmi_dimm_temps
+            .iter()
+            .find(|d| &d.name == dimm_name)
+            .map(|d| d.temp_celsius)
+            .unwrap_or(0.0);
+
+        // Include current temp in legend: "A1:64"
+        let legend_name = format!("{}:{:.0}", short_name, current_temp);
+
+        // We need to keep the data alive, so use a reference
+        datasets.push(
+            Dataset::default()
+                .name(legend_name)
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(color))
+                .data(data),
+        );
+    }
+
+    // Add warning threshold line if max temp is approaching it
+    let data_len = metrics_history.len();
+    let warning_line: Vec<(f64, f64)>;
+    let critical_line: Vec<(f64, f64)>;
+
+    if max_y >= warn_temp * 0.5 {
+        warning_line = vec![(0.0, warn_temp), (data_len as f64, warn_temp)];
+        datasets.push(
+            Dataset::default()
+                .name("warn")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Yellow))
+                .data(&warning_line),
+        );
+    }
+
+    if max_y >= crit_temp * 0.5 {
+        critical_line = vec![(0.0, crit_temp), (data_len as f64, crit_temp)];
+        datasets.push(
+            Dataset::default()
+                .name("crit")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::Red))
+                .data(&critical_line),
+        );
+    }
+
+    // Build title with DIMM count, max temp and status
+    let status_indicator = match latest.ipmi_dimm_status.as_deref() {
+        Some("nr") => " NR!",
+        Some("cr") => " CR!",
+        Some("nc") => " NC",
+        _ => "",
+    };
+    let dimm_count = dimm_names.len();
+    let title = format!(
+        "IPMI DIMM °C ({}) max:{:.0}{}",
+        dimm_count, max_temp, status_indicator
+    );
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title("IPMI/BMC [ipmitool]")
+        .title(Span::styled(title, title_style))
         .border_style(Style::default().fg(border_color));
 
-    let style = if bg_color != Color::Reset {
-        Style::default()
-            .fg(fg_color)
-            .bg(bg_color)
-            .add_modifier(Modifier::BOLD)
+    let chart = Chart::new(datasets)
+        .block(block)
+        .legend_position(Some(LegendPosition::TopRight))
+        .hidden_legend_constraints((Constraint::Min(0), Constraint::Min(0)))
+        .x_axis(
+            Axis::default()
+                .title("Time")
+                .style(Style::default().fg(Color::Gray))
+                .bounds([0.0, data_len as f64]),
+        )
+        .y_axis(
+            Axis::default()
+                .title("")
+                .style(Style::default().fg(Color::Gray))
+                .labels(vec![
+                    Span::raw(format!("{:.0}", y_range.0)),
+                    Span::raw(format!("{:.0}", y_range.1)),
+                ])
+                .bounds([y_range.0, y_range.1]),
+        );
+
+    f.render_widget(chart, area);
+}
+
+/// Shorten DIMM name for chart legend (e.g., "DIMMA1 Temp." -> "A1", "P1-DIMMC1" -> "C1").
+fn shorten_dimm_name(name: &str) -> String {
+    // Remove common suffixes like "Temp.", "Temp", "Temperature"
+    let name = name
+        .trim()
+        .trim_end_matches('.')
+        .trim_end_matches(" Temp")
+        .trim_end_matches(" Temperature")
+        .trim_end_matches("Temp")
+        .trim();
+
+    let name_upper = name.to_uppercase();
+
+    // Look for patterns like "DIMMA1", "DIMM A1", "P1-DIMMA1", etc.
+    if let Some(pos) = name_upper.find("DIMM") {
+        let suffix = &name[pos + 4..];
+        let suffix = suffix.trim_start_matches(['-', '_', ' ']);
+        if !suffix.is_empty() && suffix.len() <= 4 {
+            return suffix.to_string();
+        }
+    }
+
+    // Fallback: return last 4 chars or the whole name if shorter
+    if name.len() <= 4 {
+        name.to_string()
     } else {
-        Style::default().fg(fg_color)
-    };
-
-    let paragraph = Paragraph::new(content).style(style).block(block);
-
-    f.render_widget(paragraph, area);
+        name[name.len() - 4..].to_string()
+    }
 }
 
 /// Chart configuration including thresholds and styling.
@@ -646,7 +892,7 @@ fn draw_line_chart<F>(
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Severity::Normal => (Color::White, Style::default().fg(Color::White)),
+        Severity::Normal => (Color::Reset, Style::default()),
     };
 
     let mut datasets = vec![Dataset::default()

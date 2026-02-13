@@ -26,8 +26,8 @@ use clap::Parser;
 /// # Run in headless mode with 10-second intervals
 /// slow-rs --headless -i 10
 ///
-/// # Skip I/O benchmark if disk is suspected
-/// slow-rs --skip-io-bench
+/// # Enable I/O benchmark for disk throughput testing
+/// slow-rs --io-bench
 /// ```
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -80,11 +80,17 @@ pub struct Config {
     #[arg(long)]
     pub headless: bool,
 
-    /// Skip I/O benchmark (useful if disk is already suspected).
+    /// Enable I/O benchmark for disk throughput testing.
     ///
-    /// If you suspect the disk is failing or very slow, skipping
-    /// the I/O benchmark prevents the tool from making things worse.
-    /// System I/O stats from /proc are still collected.
+    /// When enabled, slow-rs will periodically read/write test files to
+    /// measure actual disk throughput. This is disabled by default because:
+    ///
+    /// - It drops page caches (requires root), causing major page faults
+    /// - It adds disk load which may worsen an already slow system
+    /// - It increases startup time
+    ///
+    /// System I/O stats from /proc are always collected regardless.
+    /// Enable this when you specifically want to measure disk performance.
     #[arg(long)]
-    pub skip_io_bench: bool,
+    pub io_bench: bool,
 }

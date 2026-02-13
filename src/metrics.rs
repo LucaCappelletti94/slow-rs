@@ -258,4 +258,32 @@ pub struct Metrics {
     /// Detailed IPMI DIMM info (e.g., "DIMMC1:99°C[NR], DIMMD1:100°C[NR]")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ipmi_dimm_details: Option<String>,
+    /// Individual IPMI DIMM temperatures for plotting
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ipmi_dimm_temps: Vec<IpmiDimmTemp>,
+    /// All IPMI temperature sensors (CPU, system, etc.)
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ipmi_temps: Vec<IpmiTempReading>,
+}
+
+/// Individual DIMM temperature from IPMI.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct IpmiDimmTemp {
+    /// Sensor name (e.g., "DIMMA1", "P1-DIMMC1")
+    pub name: String,
+    /// Temperature in Celsius
+    pub temp_celsius: f64,
+    /// Sensor status (ok, nc, cr, nr, na)
+    pub status: String,
+}
+
+/// General temperature reading from IPMI.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct IpmiTempReading {
+    /// Sensor name (e.g., "CPU Temp", "System Temp")
+    pub name: String,
+    /// Temperature in Celsius
+    pub temp_celsius: f64,
+    /// Sensor status
+    pub status: String,
 }

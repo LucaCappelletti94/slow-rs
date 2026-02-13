@@ -118,9 +118,9 @@ impl App {
     /// Ensure the I/O benchmark test file exists.
     ///
     /// If the file doesn't exist, creates it with the configured size.
-    /// This is skipped if `--skip-io-bench` was specified.
+    /// This is skipped unless `--io-bench` was specified.
     pub fn ensure_test_file(&self) -> std::io::Result<()> {
-        if self.config.skip_io_bench {
+        if !self.config.io_bench {
             return Ok(());
         }
 
@@ -156,9 +156,7 @@ impl App {
         let alloc_duration = benchmarks::benchmark_allocation();
         let compute_duration = benchmarks::benchmark_compute();
 
-        let (io_read, io_write, sha_duration) = if self.config.skip_io_bench {
-            (None, None, None)
-        } else {
+        let (io_read, io_write, sha_duration) = if self.config.io_bench {
             match benchmarks::benchmark_io(&self.config.test_file, self.config.file_size_mb) {
                 Ok(IoBenchmarkResult {
                     read_mb_per_sec,
@@ -171,6 +169,8 @@ impl App {
                 ),
                 Err(_) => (None, None, None),
             }
+        } else {
+            (None, None, None)
         };
 
         // === System stats from sysinfo ===
@@ -418,6 +418,14 @@ impl App {
             ipmi_dimm_details: ipmi
                 .filter(|s| s.available)
                 .and_then(|s| s.format_all_dimms()),
+            ipmi_dimm_temps: ipmi
+                .filter(|s| s.available)
+                .map(|s| s.get_dimm_temps())
+                .unwrap_or_default(),
+            ipmi_temps: ipmi
+                .filter(|s| s.available)
+                .map(|s| s.get_all_temps())
+                .unwrap_or_default(),
         };
 
         // Store current stats for next delta calculation
@@ -435,7 +443,9 @@ impl App {
     /// Log metrics to CSV file.
     fn log_metrics(&mut self, metrics: &Metrics) -> std::io::Result<()> {
         if let Some(ref mut writer) = self.csv_writer {
-            writer.serialize(metrics).map_err(std::io::Error::other)?;
+            writer
+                .serialize(metrics)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             writer.flush()?;
         }
         Ok(())
