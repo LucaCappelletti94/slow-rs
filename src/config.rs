@@ -30,7 +30,11 @@ use clap::Parser;
 /// slow-rs --skip-io-bench
 /// ```
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "Diagnose system slowdowns by monitoring performance metrics")]
+#[command(
+    author,
+    version,
+    about = "Diagnose system slowdowns by monitoring performance metrics"
+)]
 pub struct Config {
     /// Interval in seconds between measurements.
     ///

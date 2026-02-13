@@ -48,10 +48,15 @@
 //! - [`ui`]: Terminal user interface
 
 mod app;
+mod availability;
 mod benchmarks;
 mod collectors;
 mod config;
+mod ipmi;
 mod metrics;
+mod recommendations;
+mod smart;
+mod thresholds;
 mod ui;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,6 +69,21 @@ use app::App;
 use config::Config;
 
 fn main() -> std::io::Result<()> {
+    // Platform check - warn on non-Linux systems
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("╔══════════════════════════════════════════════════════════════╗");
+        eprintln!("║  WARNING: slow-rs is designed for Linux systems only!        ║");
+        eprintln!("║                                                              ║");
+        eprintln!("║  Most metrics (CPU, memory, disk, temperatures, PSI, etc.)   ║");
+        eprintln!("║  are read from /proc and /sys which don't exist on macOS.    ║");
+        eprintln!("║                                                              ║");
+        eprintln!("║  Only basic benchmarks will work. For full functionality,    ║");
+        eprintln!("║  please run on a Linux system.                               ║");
+        eprintln!("╚══════════════════════════════════════════════════════════════╝");
+        eprintln!();
+    }
+
     let config = Config::parse();
     let app = App::new(config.clone())?;
 
@@ -76,7 +96,13 @@ fn main() -> std::io::Result<()> {
 
     let interval = Duration::from_secs(config.interval);
 
-    if config.headless {
+    // Check if stdout is a TTY - if not, force headless mode
+    let use_headless = config.headless || !is_terminal();
+    if !config.headless && !is_terminal() {
+        eprintln!("Warning: stdout is not a TTY, running in headless mode");
+    }
+
+    if use_headless {
         ui::run_headless(app, running, interval)?;
     } else {
         ui::run(app, running, interval)?;
@@ -85,10 +111,22 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Global flag for signal handler (must be static for signal safety).
+static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
+
 /// Set up signal handlers for graceful shutdown.
 fn setup_signal_handler(running: Arc<AtomicBool>) {
-    // Store the running flag in a static for the signal handler
-    *RUNNING_FLAG.lock().unwrap() = Some(running);
+    // Spawn a thread to monitor the signal flag and propagate to running
+    let running_clone = running.clone();
+    std::thread::spawn(move || {
+        while running_clone.load(Ordering::Relaxed) {
+            if SIGNAL_RECEIVED.load(Ordering::Relaxed) {
+                running_clone.store(false, Ordering::Relaxed);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
 
     unsafe {
         libc::signal(
@@ -102,12 +140,12 @@ fn setup_signal_handler(running: Arc<AtomicBool>) {
     }
 }
 
-/// Global storage for the running flag (needed for signal handler).
-static RUNNING_FLAG: std::sync::Mutex<Option<Arc<AtomicBool>>> = std::sync::Mutex::new(None);
-
-/// Signal handler that sets the running flag to false.
+/// Signal handler that sets the signal flag (async-signal-safe).
 extern "C" fn signal_handler(_: i32) {
-    if let Some(ref running) = *RUNNING_FLAG.lock().unwrap() {
-        running.store(false, Ordering::Relaxed);
-    }
+    SIGNAL_RECEIVED.store(true, Ordering::Relaxed);
+}
+
+/// Check if stdout is connected to a terminal.
+fn is_terminal() -> bool {
+    unsafe { libc::isatty(libc::STDOUT_FILENO) != 0 }
 }

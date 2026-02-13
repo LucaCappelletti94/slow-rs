@@ -153,13 +153,28 @@ pub struct PsiInfo {
     pub io_full_avg60: Option<f64>,
 }
 
+/// Individual DIMM temperature reading.
+#[derive(Clone, Debug)]
+pub struct DimmTemp {
+    /// Label for the DIMM (e.g., "DIMM0", "Channel A DIMM 0")
+    pub label: String,
+    /// Temperature in Celsius
+    pub temp_celsius: f64,
+}
+
 /// Temperature readings from hwmon interfaces.
 #[derive(Clone, Debug, Default)]
 pub struct TempInfo {
     /// CPU package temperature in Celsius
     pub cpu_temp: Option<f64>,
+    /// Source of CPU temperature (e.g., "coretemp", "k10temp", "zenpower")
+    pub cpu_temp_source: Option<String>,
     /// Maximum temperature across all sensors
     pub max_temp: Option<f64>,
+    /// Individual DIMM temperatures from jc42 sensors
+    pub dimm_temps: Vec<DimmTemp>,
+    /// NVMe disk temperatures
+    pub nvme_temps: Vec<(String, f64)>,
 }
 
 /// Read memory information from `/proc/meminfo`.
@@ -355,22 +370,30 @@ fn extract_psi_value(line: &str, key: &str) -> Option<f64> {
 
 /// Read temperatures from hwmon interfaces.
 ///
-/// Looks for CPU-specific sensors (coretemp, k10temp, zenpower) and
-/// tracks the maximum temperature across all sensors.
+/// Looks for CPU-specific sensors (coretemp, k10temp, zenpower),
+/// DIMM sensors (jc42), NVMe sensors, and tracks the maximum
+/// temperature across all sensors.
 pub fn read_temperatures() -> TempInfo {
     let mut info = TempInfo::default();
     let mut max_temp: Option<f64> = None;
+    let mut dimm_index = 0;
+    let mut nvme_index = 0;
 
     if let Ok(entries) = std::fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
             let path = entry.path();
 
-            // Check device name for CPU sensors
+            // Check device name for sensor type
             let name_path = path.join("name");
-            let name = std::fs::read_to_string(&name_path).unwrap_or_default();
-            let is_cpu = name.contains("coretemp")
-                || name.contains("k10temp")
-                || name.contains("zenpower");
+            let name = std::fs::read_to_string(&name_path)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+
+            let is_cpu =
+                name.contains("coretemp") || name.contains("k10temp") || name.contains("zenpower");
+            let is_jc42 = name == "jc42";
+            let is_nvme = name == "nvme";
 
             // Read all temperature inputs
             for i in 1..=20 {
@@ -381,6 +404,35 @@ pub fn read_temperatures() -> TempInfo {
 
                         if is_cpu && info.cpu_temp.is_none() {
                             info.cpu_temp = Some(temp);
+                            info.cpu_temp_source = Some(name.clone());
+                        }
+
+                        // Collect DIMM temperatures from jc42 sensors
+                        if is_jc42 {
+                            let label_path = path.join(format!("temp{}_label", i));
+                            let label = std::fs::read_to_string(&label_path)
+                                .map(|s| s.trim().to_string())
+                                .unwrap_or_else(|_| format!("DIMM{}", dimm_index));
+                            info.dimm_temps.push(DimmTemp {
+                                label,
+                                temp_celsius: temp,
+                            });
+                            dimm_index += 1;
+                        }
+
+                        // Collect NVMe temperatures (only first/composite temp per device)
+                        if is_nvme && i == 1 {
+                            let device_path = path.join("device");
+                            let device_name = if let Ok(link) = std::fs::read_link(&device_path) {
+                                link.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("nvme")
+                                    .to_string()
+                            } else {
+                                format!("nvme{}", nvme_index)
+                            };
+                            info.nvme_temps.push((device_name, temp));
+                            nvme_index += 1;
                         }
 
                         max_temp = Some(max_temp.map_or(temp, |m: f64| m.max(temp)));
@@ -392,6 +444,31 @@ pub fn read_temperatures() -> TempInfo {
 
     info.max_temp = max_temp;
     info
+}
+
+/// Get average DIMM temperature.
+pub fn dimm_temp_avg(temps: &[DimmTemp]) -> Option<f64> {
+    if temps.is_empty() {
+        return None;
+    }
+    let sum: f64 = temps.iter().map(|d| d.temp_celsius).sum();
+    Some(sum / temps.len() as f64)
+}
+
+/// Get maximum DIMM temperature.
+pub fn dimm_temp_max(temps: &[DimmTemp]) -> Option<f64> {
+    temps
+        .iter()
+        .map(|d| d.temp_celsius)
+        .fold(None, |acc, t| Some(acc.map_or(t, |a: f64| a.max(t))))
+}
+
+/// Get maximum NVMe temperature.
+pub fn nvme_temp_max(temps: &[(String, f64)]) -> Option<f64> {
+    temps
+        .iter()
+        .map(|(_, t)| *t)
+        .fold(None, |acc, t| Some(acc.map_or(t, |a: f64| a.max(t))))
 }
 
 /// Read virtual memory statistics from `/proc/vmstat`.
@@ -457,7 +534,9 @@ impl DiskStats {
             write_time_ms: other.write_time_ms.saturating_sub(self.write_time_ms),
             io_in_progress: other.io_in_progress,
             io_time_ms: other.io_time_ms.saturating_sub(self.io_time_ms),
-            weighted_io_time_ms: other.weighted_io_time_ms.saturating_sub(self.weighted_io_time_ms),
+            weighted_io_time_ms: other
+                .weighted_io_time_ms
+                .saturating_sub(self.weighted_io_time_ms),
         }
     }
 }

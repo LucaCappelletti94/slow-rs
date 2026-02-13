@@ -38,10 +38,7 @@ pub fn benchmark_allocation() -> f64 {
     let start = Instant::now();
 
     let size = 64 * 1024 * 1024; // 64MB
-    let mut v: Vec<u8> = Vec::with_capacity(size);
-
-    // Force allocation by writing
-    v.resize(size, 0);
+    let mut v: Vec<u8> = vec![0; size];
 
     // Touch every page (4KB) to ensure actual allocation
     for i in (0..size).step_by(4096) {

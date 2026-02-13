@@ -10,10 +10,14 @@ use std::path::Path;
 use chrono::Utc;
 use sysinfo::System;
 
+use crate::availability::MetricAvailability;
 use crate::benchmarks::{self, IoBenchmarkResult};
 use crate::collectors::{self, CpuStats, DiskStats, NetStats, VmStats};
 use crate::config::Config;
+use crate::ipmi::IpmiSensors;
 use crate::metrics::Metrics;
+use crate::smart::SmartHealth;
+use crate::thresholds::Thresholds;
 
 /// Main application state.
 ///
@@ -43,6 +47,24 @@ pub struct App {
 
     /// Previous VM stats for delta calculation
     last_vm_stats: Option<VmStats>,
+
+    /// Metric source availability
+    pub availability: MetricAvailability,
+
+    /// Threshold configuration
+    pub thresholds: Thresholds,
+
+    /// Cached SMART health (collected less frequently)
+    last_smart_health: Option<SmartHealth>,
+
+    /// Counter for SMART collection interval
+    smart_collection_counter: u32,
+
+    /// Cached IPMI sensors (collected less frequently)
+    last_ipmi_sensors: Option<IpmiSensors>,
+
+    /// Counter for IPMI collection interval
+    ipmi_collection_counter: u32,
 }
 
 impl App {
@@ -72,6 +94,9 @@ impl App {
 
         let history_size = config.history_size;
 
+        // Probe metric availability at startup
+        let availability = MetricAvailability::probe();
+
         Ok(Self {
             config,
             metrics_history: VecDeque::with_capacity(history_size),
@@ -81,6 +106,12 @@ impl App {
             last_net_stats: None,
             last_cpu_stats: None,
             last_vm_stats: None,
+            availability,
+            thresholds: Thresholds::default(),
+            last_smart_health: None,
+            smart_collection_counter: 0,
+            last_ipmi_sensors: None,
+            ipmi_collection_counter: 0,
         })
     }
 
@@ -167,6 +198,66 @@ impl App {
         let vm_stats = collectors::read_vmstat();
         let (fd_allocated, fd_max) = collectors::read_fd_stats();
         let uptime = collectors::read_uptime();
+
+        // === Collect SMART health (every 12 iterations = ~1 minute at 5s interval) ===
+        self.smart_collection_counter += 1;
+        if self.smart_collection_counter >= 12 || self.last_smart_health.is_none() {
+            self.last_smart_health = Some(SmartHealth::collect());
+            self.smart_collection_counter = 0;
+        }
+        let smart = self.last_smart_health.as_ref();
+
+        // === Collect IPMI sensors (every 12 iterations = ~1 minute at 5s interval) ===
+        self.ipmi_collection_counter += 1;
+        if self.ipmi_collection_counter >= 12 || self.last_ipmi_sensors.is_none() {
+            self.last_ipmi_sensors = Some(IpmiSensors::collect());
+            self.ipmi_collection_counter = 0;
+        }
+        let ipmi = self.last_ipmi_sensors.as_ref();
+
+        // === Process DIMM temperatures ===
+        let dimm_temps_str = if temps.dimm_temps.is_empty() {
+            None
+        } else {
+            Some(
+                temps
+                    .dimm_temps
+                    .iter()
+                    .map(|d| format!("{}:{:.1}", d.label, d.temp_celsius))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        };
+        let dimm_temp_avg = collectors::dimm_temp_avg(&temps.dimm_temps);
+        let dimm_temp_max = collectors::dimm_temp_max(&temps.dimm_temps);
+
+        // === Determine disk temperature (prefer NVMe hwmon, fallback to SMART) ===
+        let (disk_temps, disk_temp_max, disk_temp_source) = if !temps.nvme_temps.is_empty() {
+            let temps_str = temps
+                .nvme_temps
+                .iter()
+                .map(|(name, temp)| format!("{}:{:.1}", name, temp))
+                .collect::<Vec<_>>()
+                .join(",");
+            let max = collectors::nvme_temp_max(&temps.nvme_temps);
+            (Some(temps_str), max, Some("nvme hwmon".to_string()))
+        } else if let Some(smart_temp) = smart.and_then(|s| s.max_temperature()) {
+            (None, Some(smart_temp), Some("smartctl".to_string()))
+        } else {
+            (None, None, None)
+        };
+
+        // === Determine DIMM temperature source ===
+        let dimm_temp_source = if !temps.dimm_temps.is_empty() {
+            Some("jc42 hwmon".to_string())
+        } else if ipmi
+            .map(|s| s.available && s.max_dimm_temp().is_some())
+            .unwrap_or(false)
+        {
+            Some("ipmi".to_string())
+        } else {
+            None
+        };
 
         // === Calculate deltas ===
         let disk_delta = self
@@ -271,7 +362,15 @@ impl App {
             io_pressure_full_avg60: psi.io_full_avg60,
 
             cpu_temp_celsius: temps.cpu_temp,
+            cpu_temp_source: temps.cpu_temp_source,
             max_temp_celsius: temps.max_temp,
+            dimm_temps: dimm_temps_str,
+            dimm_temp_source,
+            dimm_temp_avg,
+            dimm_temp_max,
+            disk_temps,
+            disk_temp_source,
+            disk_temp_max,
 
             context_switches: cpu_delta.as_ref().map(|s| s.context_switches).unwrap_or(0),
             interrupts: cpu_delta.as_ref().map(|s| s.interrupts).unwrap_or(0),
@@ -295,6 +394,30 @@ impl App {
             fd_max,
 
             uptime_secs: uptime,
+
+            smart_available: smart.map(|s| s.available),
+            smart_health_all_passed: smart.filter(|s| s.available).map(|s| s.all_healthy()),
+            smart_reallocated_sectors_total: smart
+                .filter(|s| s.available)
+                .map(|s| s.total_reallocated_sectors()),
+            smart_pending_sectors_total: smart
+                .filter(|s| s.available)
+                .map(|s| s.total_pending_sectors()),
+
+            ipmi_available: ipmi.map(|s| s.available),
+            ipmi_dimm_temp_max: ipmi.filter(|s| s.available).and_then(|s| s.max_dimm_temp()),
+            ipmi_dimm_status: ipmi
+                .filter(|s| s.available)
+                .map(|s| match s.worst_dimm_status() {
+                    crate::ipmi::SensorStatus::Ok => "ok".to_string(),
+                    crate::ipmi::SensorStatus::NonCritical => "nc".to_string(),
+                    crate::ipmi::SensorStatus::Critical => "cr".to_string(),
+                    crate::ipmi::SensorStatus::NonRecoverable => "nr".to_string(),
+                    crate::ipmi::SensorStatus::NotAvailable => "na".to_string(),
+                }),
+            ipmi_dimm_details: ipmi
+                .filter(|s| s.available)
+                .and_then(|s| s.format_all_dimms()),
         };
 
         // Store current stats for next delta calculation
@@ -312,9 +435,7 @@ impl App {
     /// Log metrics to CSV file.
     fn log_metrics(&mut self, metrics: &Metrics) -> std::io::Result<()> {
         if let Some(ref mut writer) = self.csv_writer {
-            writer
-                .serialize(metrics)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            writer.serialize(metrics).map_err(std::io::Error::other)?;
             writer.flush()?;
         }
         Ok(())

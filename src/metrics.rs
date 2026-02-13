@@ -166,8 +166,24 @@ pub struct Metrics {
     // ===== Temperatures =====
     /// CPU package temperature in Celsius
     pub cpu_temp_celsius: Option<f64>,
+    /// Source of CPU temperature (e.g., "coretemp", "k10temp", "zenpower")
+    pub cpu_temp_source: Option<String>,
     /// Maximum temperature across all sensors in Celsius
     pub max_temp_celsius: Option<f64>,
+    /// DIMM temperatures as comma-separated string (e.g., "DIMM0:45.5,DIMM1:46.0")
+    pub dimm_temps: Option<String>,
+    /// Source of DIMM temperature (e.g., "jc42", "ipmi")
+    pub dimm_temp_source: Option<String>,
+    /// Average DIMM temperature in Celsius
+    pub dimm_temp_avg: Option<f64>,
+    /// Maximum DIMM temperature in Celsius
+    pub dimm_temp_max: Option<f64>,
+    /// Disk temperatures as comma-separated string (e.g., "nvme0:55.0,nvme1:52.0")
+    pub disk_temps: Option<String>,
+    /// Source of disk temperature (e.g., "nvme hwmon", "smartctl")
+    pub disk_temp_source: Option<String>,
+    /// Maximum disk temperature in Celsius (from NVMe or SMART)
+    pub disk_temp_max: Option<f64>,
 
     // ===== Context Switches and Interrupts (delta) =====
     /// Number of context switches
@@ -214,4 +230,32 @@ pub struct Metrics {
     // ===== System =====
     /// System uptime in seconds
     pub uptime_secs: f64,
+
+    // ===== SMART Health =====
+    /// Whether SMART data is available
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smart_available: Option<bool>,
+    /// Whether all disks passed health check
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smart_health_all_passed: Option<bool>,
+    /// Total reallocated sectors across all disks
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smart_reallocated_sectors_total: Option<u64>,
+    /// Total pending sectors across all disks
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smart_pending_sectors_total: Option<u64>,
+
+    // ===== IPMI Sensors =====
+    /// Whether IPMI data is available
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipmi_available: Option<bool>,
+    /// IPMI DIMM temperature (max across all DIMMs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipmi_dimm_temp_max: Option<f64>,
+    /// IPMI DIMM status (ok, nc, cr, nr)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipmi_dimm_status: Option<String>,
+    /// Detailed IPMI DIMM info (e.g., "DIMMC1:99°C[NR], DIMMD1:100°C[NR]")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipmi_dimm_details: Option<String>,
 }
